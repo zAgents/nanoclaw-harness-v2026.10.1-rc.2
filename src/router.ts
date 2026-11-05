@@ -31,7 +31,13 @@ import {
 import { findSessionForAgent } from './db/sessions.js';
 import { backfillSession, fanInboundMessage } from './modules/cross-session-context/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
-import { log } from './log.js';
+import {
+  log,
+  recordInboundForSession,
+  entryNodeForAgentFolder,
+  traceScopeForAgentFolder,
+  writeTraceSentinels,
+} from './log.js';
 import { resolveSession, writeSessionMessage } from './session-manager.js';
 import { requestWake } from './request-wake.js';
 import { getSession } from './db/sessions.js';
@@ -630,6 +636,25 @@ async function deliverToAgent(
     });
   }
 
+  // Per-invocation tracing: trace_id = inbound message id (one trace per
+  // invocation). request_summary = first ~120 chars of the user's actual text.
+  // node_id = the agent's wiki entry node — for an agent mapped via
+  // entryNodeForAgentFolder() that's `<scope>:soul`; otherwise the fallback
+  // `<agent_folder>:claude.local`.
+  const inboundText = safeParseContent(event.message.content).text ?? '';
+  const summaryShort = inboundText.replace(/\s+/g, ' ').trim().slice(0, 120) || `(${event.message.kind} message)`;
+  const entryNode = entryNodeForAgentFolder(agentGroup.folder);
+  recordInboundForSession(session.id, event.message.id);
+  // Sentinels for container-side intermediate trace emission. The PreToolUse
+  // hook in container/agent-runner reads these to tag `read`/`write` events
+  // with the right trace_id + agent scope. Updated per-inbound so coalesced
+  // sessions still attribute intermediate events to the most recent invocation.
+  writeTraceSentinels(
+    session.agent_group_id,
+    session.id,
+    event.message.id,
+    traceScopeForAgentFolder(agentGroup.folder),
+  );
   log.info('Message routed', {
     sessionId: session.id,
     agentGroup: agent.agent_group_id,
@@ -639,6 +664,14 @@ async function deliverToAgent(
     wake,
     created,
     agentGroupName: agentGroup.name,
+    summary: summaryShort,
+    trace: {
+      trace_id: event.message.id,
+      agent_folder: agentGroup.folder,
+      event: 'entry',
+      node_id: entryNode,
+      summary: summaryShort,
+    },
   });
 
   if (wake) {

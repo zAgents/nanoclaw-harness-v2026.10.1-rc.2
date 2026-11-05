@@ -1,3 +1,6 @@
+import fs from 'fs';
+import path from 'path';
+
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
@@ -32,6 +35,167 @@ export interface SdkRateLimitInfo {
   utilization?: number;
   errorCode?: string;
   overageDisabledReason?: string;
+}
+
+// ── Vault gate ──
+//
+// Implements MasterMind/Vault.md rules 1 (per-agent isolation) and 5 (auto-force
+// tracing on own-vault read). Rules 2/3/4 are behavioral and out of scope here.
+// Hook into PreToolUse — runs the moment Claude attempts a tool call, sees both
+// tool_name and tool_input, can return decision='block'.
+//
+// Path semantics (per v2 container layout + MasterMind/Vault.md):
+//   /workspace/vault/...        own attached-files mount (single-spawn scope)
+//   /workspace/agent/Vault/...  own group-folder Vault subdir (used by the
+//                               Phase-3 walking-skeleton sentinel)
+//   anything else containing /Vault/  cross-agent path → block
+//
+// On own-vault touch we append to /workspace/.trace-forced. The Track-B JSONL
+// sink reads this marker to force tracing for the rest of the spawn.
+
+const VAULT_FILE_TOOLS = new Set(['Read', 'Write', 'Edit']);
+const VAULT_OWN_ATTACHED = '/workspace/vault';
+const VAULT_OWN_GROUP = '/workspace/agent/Vault';
+const VAULT_TRACE_MARKER = '/workspace/.trace-forced';
+const VAULT_PATH_RE = /\/[Vv]ault(\/|$)/;
+const VAULT_BASH_PATH_RE = /(?:^|[\s'"=:])(\/[\w\-./~]*[Vv]ault[\w\-./]*)/g;
+
+function extractVaultPaths(toolName: string, toolInput: Record<string, unknown>): string[] {
+  if (VAULT_FILE_TOOLS.has(toolName)) {
+    const candidate = toolInput.file_path ?? toolInput.path;
+    return typeof candidate === 'string' ? [candidate] : [];
+  }
+  if (toolName === 'Bash') {
+    const cmd = typeof toolInput.command === 'string' ? toolInput.command : '';
+    const out: string[] = [];
+    let m: RegExpExecArray | null;
+    VAULT_BASH_PATH_RE.lastIndex = 0;
+    while ((m = VAULT_BASH_PATH_RE.exec(cmd)) !== null) {
+      if (m[1]) out.push(m[1]);
+    }
+    return out;
+  }
+  return [];
+}
+
+function isOwnVaultPath(p: string): boolean {
+  const n = path.normalize(p);
+  return (
+    n === VAULT_OWN_ATTACHED ||
+    n.startsWith(VAULT_OWN_ATTACHED + '/') ||
+    n === VAULT_OWN_GROUP ||
+    n.startsWith(VAULT_OWN_GROUP + '/')
+  );
+}
+
+interface VaultDecision {
+  block: boolean;
+  forceTrace: boolean;
+  reason: string;
+}
+
+function evaluateVaultPath(p: string): VaultDecision {
+  if (isOwnVaultPath(p)) {
+    return { block: false, forceTrace: true, reason: 'own vault — auto-force tracing (rule 5)' };
+  }
+  if (VAULT_PATH_RE.test(p)) {
+    return { block: true, forceTrace: false, reason: 'cross-agent vault path (rule 1)' };
+  }
+  return { block: false, forceTrace: false, reason: '' };
+}
+
+function markTraceForced(toolName: string, p: string, reason: string): void {
+  try {
+    fs.appendFileSync(VAULT_TRACE_MARKER, `${new Date().toISOString()}\t${toolName}\t${p}\t${reason}\n`);
+  } catch (err) {
+    log(`vault-gate: failed to write trace marker: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+// ── Container-side trace emission ──
+//
+// Per `_ProjectWiki/TracingPlan.md`, agents emit `read`/`write`/`mcp_call`
+// events from inside the container so the trace shows actual reasoning steps
+// (not just host-emitted entry/exit anchors). The host writes the current
+// inbound msg.id to /workspace/.current-trace-id at routing time; this hook
+// reads it to tag emitted events with the right trace_id.
+//
+// Mind-file detection: anything matching /workspace/agent/<basename>.md (root
+// of the group folder) is treated as a Mind page. The node_id is derived as
+// `<agent>:<basename-lowercased-no-ext>`. The `<agent>` scope is read from
+// /workspace/.current-agent (host-written sibling sentinel) so this code stays
+// folder-agnostic — works for any agent group folder.
+
+const TRACE_ID_FILE = '/workspace/.current-trace-id';
+const TRACE_AGENT_FILE = '/workspace/.current-agent';
+const MIND_FILE_RE = /^\/workspace\/agent\/([A-Za-z][\w-]*)\.md$/;
+
+function readSentinel(p: string): string | undefined {
+  try {
+    const v = fs.readFileSync(p, 'utf8').trim();
+    return v.length ? v : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function dateDir(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function appendTraceEvent(payload: Record<string, unknown>): void {
+  const traceId = readSentinel(TRACE_ID_FILE);
+  if (!traceId) return;
+  const dir = `/workspace/agent/Traces/${dateDir()}`;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(`${dir}/${traceId}.jsonl`, JSON.stringify(payload) + '\n');
+  } catch (err) {
+    log(`trace-emit: failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+function emitMindEvent(toolName: string, mindPath: string): void {
+  const traceId = readSentinel(TRACE_ID_FILE);
+  const agent = readSentinel(TRACE_AGENT_FILE);
+  if (!traceId || !agent) return; // no active invocation context; silently drop
+  const m = MIND_FILE_RE.exec(mindPath);
+  if (!m) return;
+  const slug = m[1].toLowerCase();
+  const eventName = toolName === 'Read' ? 'read' : 'write';
+  appendTraceEvent({
+    trace_id: traceId,
+    timestamp: new Date().toISOString(),
+    agent,
+    node_id: `${agent}:${slug}`,
+    event: eventName,
+    related_node_id: null,
+    metadata: { tool: toolName, path: mindPath },
+  });
+}
+
+/**
+ * Vault decisions are also trace events: rule-1 BLOCK and rule-5 AUTO-TRACE
+ * both go into the JSONL so Nova surfaces *why* a vault path was touched
+ * (or refused) alongside the agent's reasoning steps. Uses the standard
+ * `vault_access` event shape, with `metadata.reason` carrying the gate's
+ * own explanation string.
+ */
+function emitVaultEvent(toolName: string, vaultPath: string, decision: 'allow' | 'block', reason: string): void {
+  const traceId = readSentinel(TRACE_ID_FILE);
+  const agent = readSentinel(TRACE_AGENT_FILE);
+  if (!traceId || !agent) return;
+  const safeSlug = vaultPath.replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60) || 'vault';
+  appendTraceEvent({
+    trace_id: traceId,
+    timestamp: new Date().toISOString(),
+    agent,
+    node_id: `${agent}:vault:${safeSlug}`,
+    event: 'vault_access',
+    related_node_id: null,
+    metadata: { tool: toolName, path: vaultPath, decision, reason },
+  });
 }
 
 /**
@@ -128,6 +292,31 @@ const preToolUseHook: HookCallback = async (input) => {
       decision: 'block',
       stopReason: `Tool '${toolName}' is not available in this environment — use the nanoclaw equivalent.`,
     } as unknown as ReturnType<HookCallback>;
+  }
+  // Vault gate (MasterMind/Vault.md rules 1 + 5).
+  const vaultPaths = extractVaultPaths(toolName, i.tool_input ?? {});
+  for (const p of vaultPaths) {
+    const decision = evaluateVaultPath(p);
+    if (decision.block) {
+      log(`vault-gate: BLOCK ${toolName} "${p}" (${decision.reason})`);
+      emitVaultEvent(toolName, p, 'block', decision.reason);
+      return {
+        decision: 'block',
+        stopReason: `Vault rule 1 (per-agent isolation): you may not access "${p}" — that's another agent's Vault, or a path that looks like one. If you genuinely need this, ask the operator directly per MasterMind/Vault.md (no agent→agent vault transfer).`,
+      } as unknown as ReturnType<HookCallback>;
+    }
+    if (decision.forceTrace) {
+      log(`vault-gate: AUTO-TRACE ${toolName} "${p}" (${decision.reason})`);
+      markTraceForced(toolName, p, decision.reason);
+      emitVaultEvent(toolName, p, 'allow', decision.reason);
+    }
+  }
+  // Mind-page touch → emit a `read`/`write` trace event so Nova shows
+  // intermediate steps (the agent reasoning), not just host entry/exit
+  // anchors. Only fires on Read/Write/Edit; Bash and other tools skipped.
+  if (VAULT_FILE_TOOLS.has(toolName)) {
+    const target = (i.tool_input?.file_path ?? i.tool_input?.path) as string | undefined;
+    if (typeof target === 'string') emitMindEvent(toolName, target);
   }
   // Bash exposes its timeout via the tool_input.timeout field (ms). Any other
   // tool: no declared timeout.

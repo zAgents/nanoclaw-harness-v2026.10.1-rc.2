@@ -30,7 +30,7 @@ import { runGuarded, type DeliveryGuardSpec, type GuardedDeliveryHandler } from 
 import { isUnguarded, type Unguarded } from './guard/index.js';
 import { mapConcurrent } from './concurrency.js';
 import { fanOutboundMessage } from './modules/cross-session-context/index.js';
-import { log } from './log.js';
+import { log, traceIdForSession, entryNodeForAgentFolder } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
@@ -547,12 +547,38 @@ async function deliverMessage(
     files,
     deliverInstance,
   );
+  const ag = await getAgentGroup(session.agent_group_id);
+  // Pair this exit with the most-recent inbound on this session: that's the
+  // invocation we just answered. Falls back silently if the map has no entry
+  // yet (e.g., system-action delivery with no preceding route on this session).
+  const traceId = ag ? traceIdForSession(session.id) : undefined;
+  const exitNode = ag ? entryNodeForAgentFolder(ag.folder) : undefined;
+  let responseLength: number | undefined;
+  /* eslint-disable no-catch-all/no-catch-all -- not chat-shaped content just leaves response_length undefined */
+  try {
+    const parsed = JSON.parse(msg.content) as { text?: string };
+    if (typeof parsed.text === 'string') responseLength = parsed.text.length;
+  } catch {
+    /* not chat-shaped */
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
   log.info('Message delivered', {
     id: msg.id,
     channelType: msg.channelType,
     platformId: msg.platformId,
     platformMsgId,
     fileCount: files?.length,
+    ...(ag && traceId && exitNode
+      ? {
+          trace: {
+            trace_id: traceId,
+            agent_folder: ag.folder,
+            event: 'exit',
+            node_id: exitNode,
+          },
+          response_length: responseLength,
+        }
+      : {}),
   });
 
   clearOutbox(session.agent_group_id, session.id, msg.id);
